@@ -382,6 +382,80 @@ index e3ff26cc6..e78ebaaab 100644
              sent.append(payload["message"])
              return {"data": {"guid": f"msg-{len(sent)}"}}
  
+diff --git a/tests/gateway/test_bluebubbles_send_path.py b/tests/gateway/test_bluebubbles_send_path.py
+new file mode 100644
+index 000000000..590599111
+--- /dev/null
++++ b/tests/gateway/test_bluebubbles_send_path.py
+@@ -0,0 +1,68 @@
++"""Tests for BlueBubbles send-path chat resolution behavior."""
++
++import pytest
++
++from gateway.config import PlatformConfig
++from gateway.platforms.bluebubbles import BlueBubblesAdapter
++from gateway.platforms.base import SendResult
++
++
++@pytest.mark.asyncio
++async def test_send_uses_reply_guid_to_resolve_existing_chat_without_chat_new(monkeypatch):
++    adapter = BlueBubblesAdapter(PlatformConfig())
++    adapter._private_api_enabled = True
++    adapter._helper_connected = True
++    calls = []
++
++    async def fake_api_post(path, payload, *, timeout=None):
++        calls.append((path, payload, timeout))
++        if path == "/api/v1/chat/query":
++            return {
++                "data": [
++                    {
++                        "guid": "iMessage;-;+15551234567",
++                        "chatIdentifier": "+15551234567",
++                        "participants": [{"address": "+15551234567"}],
++                        "lastMessage": {"guid": "incoming-guid"},
++                    }
++                ]
++            }
++        if path == "/api/v1/message/text":
++            assert payload["chatGuid"] == "iMessage;-;+15551234567"
++            assert payload["selectedMessageGuid"] == "incoming-guid"
++            return {"data": {"guid": "outgoing-guid"}}
++        raise AssertionError(f"unexpected POST path {path}")
++
++    monkeypatch.setattr(adapter, "_api_post", fake_api_post)
++
++    result = await adapter.send(
++        chat_id="+15551234567",
++        content="hello",
++        reply_to="incoming-guid",
++    )
++
++    assert result.success
++    assert result.message_id == "outgoing-guid"
++    assert [path for path, _, _ in calls] == ["/api/v1/chat/query", "/api/v1/message/text"]
++
++
++@pytest.mark.asyncio
++async def test_send_falls_back_to_chat_new_only_when_chat_guid_unresolved(monkeypatch):
++    adapter = BlueBubblesAdapter(PlatformConfig())
++    adapter._private_api_enabled = True
++    calls = []
++
++    async def fake_resolve_chat_guid(chat_id, reply_to=None):
++        return None
++
++    async def fake_create_chat_for_handle(address, message):
++        calls.append((address, message))
++        return SendResult(success=True, message_id="created")
++
++    monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
++    monkeypatch.setattr(adapter, "_create_chat_for_handle", fake_create_chat_for_handle)
++
++    result = await adapter.send("+15551234567", "hello")
++
++    assert result.success
++    assert calls == [("+15551234567", "hello")]
 diff --git a/tests/gateway/test_send_retry.py b/tests/gateway/test_send_retry.py
 index 62945d9f4..412e7b1bc 100644
 --- a/tests/gateway/test_send_retry.py
