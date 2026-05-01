@@ -1,0 +1,387 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 9f5304239..5f40af71a 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -2046,7 +2046,14 @@ class BasePlatformAdapter(ABC):
+         if not error:
+             return False
+         lowered = error.lower()
+-        return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
++        if "connecttimeout" in lowered or "connect timeout" in lowered:
++            return False
++        return (
++            "timed out" in lowered
++            or "timeout" in lowered
++            or "readtimeout" in lowered
++            or "writetimeout" in lowered
++        )
+ 
+     async def _send_with_retry(
+         self,
+@@ -2066,6 +2073,21 @@ class BasePlatformAdapter(ABC):
+         know to retry rather than waiting indefinitely.
+         """
+ 
++        def _log_send_failure(stage: str, failed_result: "SendResult", attempted_content: str) -> None:
++            logger.error(
++                "[%s] Send failed during %s. Attempted payload: chat_id=%r reply_to=%r "
++                "metadata=%r content=%r. Error: %r. Raw response: %r. Retryable: %s",
++                self.name,
++                stage,
++                chat_id,
++                reply_to,
++                metadata,
++                attempted_content,
++                failed_result.error,
++                failed_result.raw_response,
++                failed_result.retryable,
++            )
++
+         result = await self.send(
+             chat_id=chat_id,
+             content=content,
+@@ -2076,12 +2098,14 @@ class BasePlatformAdapter(ABC):
+         if result.success:
+             return result
+ 
++        _log_send_failure("initial send", result, content)
+         error_str = result.error or ""
+-        is_network = result.retryable or self._is_retryable_error(error_str)
++        is_timeout = self._is_timeout_error(error_str)
++        is_network = (result.retryable or self._is_retryable_error(error_str)) and not is_timeout
+ 
+         # Timeout errors are not safe to retry (message may have been
+         # delivered) and not formatting errors — return the failure as-is.
+-        if not is_network and self._is_timeout_error(error_str):
++        if is_timeout:
+             return result
+ 
+         if is_network:
+@@ -2102,7 +2126,10 @@ class BasePlatformAdapter(ABC):
+                 if result.success:
+                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                     return result
++                _log_send_failure(f"retry {attempt}/{max_retries}", result, content)
+                 error_str = result.error or ""
++                if self._is_timeout_error(error_str):
++                    return result
+                 if not (result.retryable or self._is_retryable_error(error_str)):
+                     break  # error switched to non-transient — fall through to plain-text fallback
+             else:
+@@ -2113,21 +2140,29 @@ class BasePlatformAdapter(ABC):
+                     "Please try again \u2014 your request was processed but the response could not be sent."
+                 )
+                 try:
+-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
++                    notice_result = await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
++                    if not notice_result.success:
++                        _log_send_failure("delivery-failure notice", notice_result, notice)
+                 except Exception as notify_err:
+-                    logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
++                    logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err, exc_info=True)
+                 return result
+ 
+         # Non-network / post-retry formatting failure: try plain text as fallback
+-        logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
++        fallback_content = f"(Response formatting failed, plain text:)\n\n{content[:3500]}"
++        logger.warning(
++            "[%s] Send failed: %s — trying plain-text fallback with content=%r",
++            self.name,
++            error_str,
++            fallback_content,
++        )
+         fallback_result = await self.send(
+             chat_id=chat_id,
+-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
++            content=fallback_content,
+             reply_to=reply_to,
+             metadata=metadata,
+         )
+         if not fallback_result.success:
+-            logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
++            _log_send_failure("plain-text fallback", fallback_result, fallback_content)
+         return fallback_result
+ 
+     @staticmethod
+diff --git a/gateway/platforms/bluebubbles.py b/gateway/platforms/bluebubbles.py
+index afcbf1a7e..12b082225 100644
+--- a/gateway/platforms/bluebubbles.py
++++ b/gateway/platforms/bluebubbles.py
+@@ -129,6 +129,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+         self._private_api_enabled: Optional[bool] = None
+         self._helper_connected: bool = False
+         self._guid_cache: Dict[str, str] = {}
++        self._reply_chat_cache: Dict[str, str] = {}
+ 
+     # ------------------------------------------------------------------
+     # API helpers
+@@ -144,11 +145,31 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+         res.raise_for_status()
+         return res.json()
+ 
+-    async def _api_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
++    async def _api_post(
++        self,
++        path: str,
++        payload: Dict[str, Any],
++        *,
++        timeout: Optional[float] = None,
++    ) -> Dict[str, Any]:
+         assert self.client is not None
+-        res = await self.client.post(self._api_url(path), json=payload)
+-        res.raise_for_status()
+-        return res.json()
++        try:
++            res = await self.client.post(self._api_url(path), json=payload, timeout=timeout)
++        except Exception as exc:
++            raise RuntimeError(f"POST {path} failed before response: {type(exc).__name__}: {exc}") from exc
++        try:
++            res.raise_for_status()
++        except httpx.HTTPStatusError as exc:
++            body = exc.response.text if exc.response is not None else ""
++            raise RuntimeError(
++                f"POST {path} failed with HTTP {exc.response.status_code}: {body}"
++            ) from exc
++        try:
++            return res.json()
++        except Exception as exc:
++            raise RuntimeError(
++                f"POST {path} returned non-JSON response HTTP {res.status_code}: {res.text}"
++            ) from exc
+ 
+     # ------------------------------------------------------------------
+     # Lifecycle
+@@ -335,13 +356,64 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+     # Chat GUID resolution
+     # ------------------------------------------------------------------
+ 
+-    async def _resolve_chat_guid(self, target: str) -> Optional[str]:
++    def _cache_chat_aliases(self, chat: Dict[str, Any], guid: Optional[str]) -> None:
++        """Cache known address/identifier aliases for a BlueBubbles chat GUID."""
++        if not guid:
++            return
++        identifier = chat.get("chatIdentifier") or chat.get("identifier")
++        if identifier:
++            self._guid_cache[str(identifier).strip()] = guid
++        for part in chat.get("participants", []) or []:
++            address = (part.get("address") or "").strip()
++            if address:
++                self._guid_cache[address] = guid
++
++    async def _find_chat_guid_for_reply(self, reply_to: Optional[str]) -> Optional[str]:
++        """Find the chat GUID that owns an inbound message GUID.
++
++        BlueBubbles webhook events for 1:1 iMessage chats can report the chat
++        as only a phone/email address. Creating a new chat for every reply is
++        slow and can time out, so use the inbound message GUID to identify and
++        cache the existing chat when possible.
++        """
++        reply_to = (reply_to or "").strip()
++        if not reply_to:
++            return None
++        if reply_to in self._reply_chat_cache:
++            return self._reply_chat_cache[reply_to]
++        try:
++            payload = await self._api_post(
++                "/api/v1/chat/query",
++                {"limit": 100, "offset": 0, "with": ["participants", "lastMessage"]},
++                timeout=10.0,
++            )
++            for chat in payload.get("data", []) or []:
++                guid = chat.get("guid") or chat.get("chatGuid")
++                message_guids = {
++                    str(chat.get("lastMessageGuid") or "").strip(),
++                    str(chat.get("last_message_guid") or "").strip(),
++                }
++                last_message = chat.get("lastMessage") or chat.get("last_message") or {}
++                if isinstance(last_message, dict):
++                    message_guids.add(str(last_message.get("guid") or "").strip())
++                    message_guids.add(str(last_message.get("messageGuid") or "").strip())
++                if guid and reply_to in message_guids:
++                    self._reply_chat_cache[reply_to] = guid
++                    self._cache_chat_aliases(chat, guid)
++                    return guid
++        except Exception as exc:
++            logger.debug("[bluebubbles] reply chat lookup failed for %s: %s", reply_to, exc)
++        return None
++
++    async def _resolve_chat_guid(self, target: str, reply_to: Optional[str] = None) -> Optional[str]:
+         """Resolve an email/phone to a BlueBubbles chat GUID.
+ 
+         If *target* already contains a semicolon (raw GUID format like
+         ``iMessage;-;user@example.com``), it is returned as-is.  Otherwise
+         the adapter queries the BlueBubbles chat list and matches on
+-        ``chatIdentifier`` or participant address.
++        ``chatIdentifier`` or participant address.  When a reply message GUID
++        is available, prefer using it to bind address-only 1:1 chats to their
++        existing chat GUID and avoid the slow ``/chat/new`` path.
+         """
+         target = (target or "").strip()
+         if not target:
+@@ -351,10 +423,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+             return target
+         if target in self._guid_cache:
+             return self._guid_cache[target]
++        reply_guid = await self._find_chat_guid_for_reply(reply_to)
++        if reply_guid:
++            self._guid_cache[target] = reply_guid
++            return reply_guid
+         try:
+             payload = await self._api_post(
+                 "/api/v1/chat/query",
+                 {"limit": 100, "offset": 0, "with": ["participants"]},
++                timeout=10.0,
+             )
+             for chat in payload.get("data", []) or []:
+                 guid = chat.get("guid") or chat.get("chatGuid")
+@@ -362,31 +439,38 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+                 if identifier == target:
+                     if guid:
+                         self._guid_cache[target] = guid
++                        self._cache_chat_aliases(chat, guid)
+                     return guid
+                 for part in chat.get("participants", []) or []:
+                     if (part.get("address") or "").strip() == target and guid:
+                         self._guid_cache[target] = guid
++                        self._cache_chat_aliases(chat, guid)
+                         return guid
+-        except Exception:
+-            pass
++        except Exception as exc:
++            logger.debug("[bluebubbles] chat GUID lookup failed for %s: %s", target, exc)
+         return None
+ 
+     async def _create_chat_for_handle(
+         self, address: str, message: str
+     ) -> SendResult:
+         """Create a new chat by sending the first message to *address*."""
++        temp_guid = f"temp-{datetime.utcnow().timestamp()}"
+         payload = {
+             "addresses": [address],
+             "message": message,
+-            "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
++            "tempGuid": temp_guid,
+         }
+         try:
+-            res = await self._api_post("/api/v1/chat/new", payload)
++            res = await self._api_post("/api/v1/chat/new", payload, timeout=90.0)
+             data = res.get("data") or {}
+-            msg_id = data.get("guid") or data.get("messageGuid") or "ok"
++            msg_id = data.get("guid") or data.get("messageGuid") or temp_guid
+             return SendResult(success=True, message_id=str(msg_id), raw_response=res)
+         except Exception as exc:
+-            return SendResult(success=False, error=str(exc))
++            error = f"{type(exc).__name__}: {exc}"
++            retryable = isinstance(getattr(exc, "__cause__", None), httpx.TimeoutException) or isinstance(
++                exc, httpx.TimeoutException
++            )
++            return SendResult(success=False, error=error, retryable=retryable)
+ 
+     # ------------------------------------------------------------------
+     # Text sending
+@@ -421,7 +505,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+                 chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
+         last = SendResult(success=True)
+         for chunk in chunks:
+-            guid = await self._resolve_chat_guid(chat_id)
++            guid = await self._resolve_chat_guid(chat_id, reply_to=reply_to)
+             if not guid:
+                 # If the target looks like an address, try creating a new chat
+                 if self._private_api_enabled and (
+@@ -449,7 +533,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+                     success=True, message_id=str(msg_id), raw_response=res
+                 )
+             except Exception as exc:
+-                return SendResult(success=False, error=str(exc))
++                logger.error(
++                    "[bluebubbles] send failure to %s with payload=%r: %s",
++                    guid,
++                    payload,
++                    exc,
++                    exc_info=True,
++                )
++                return SendResult(success=False, error=f"{type(exc).__name__}: {exc}")
+         return last
+ 
+     # ------------------------------------------------------------------
+@@ -896,15 +987,20 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+         if not sender or not (chat_guid or chat_identifier) or not text:
+             return web.json_response({"error": "missing message fields"}, status=400)
+ 
+-        session_chat_id = chat_guid or chat_identifier
++        session_chat_id = chat_identifier or chat_guid or sender
+         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
++        # For DMs, always prefer the sender (phone/email) as the session ID
++        # to avoid duplication between GUID and identifier.
++        if not is_group and sender:
++            session_chat_id = sender
++
+         source = self.build_source(
+             chat_id=session_chat_id,
+             chat_name=chat_identifier or sender,
+             chat_type="group" if is_group else "dm",
+             user_id=sender,
+             user_name=sender,
+-            chat_id_alt=chat_identifier,
++            chat_id_alt=chat_guid,
+         )
+         event = MessageEvent(
+             text=text,
+diff --git a/tests/gateway/test_bluebubbles.py b/tests/gateway/test_bluebubbles.py
+index e3ff26cc6..e78ebaaab 100644
+--- a/tests/gateway/test_bluebubbles.py
++++ b/tests/gateway/test_bluebubbles.py
+@@ -82,10 +82,10 @@ class TestBlueBubblesHelpers:
+         adapter = _make_adapter(monkeypatch)
+         sent = []
+ 
+-        async def fake_resolve_chat_guid(chat_id):
++        async def fake_resolve_chat_guid(chat_id, reply_to=None):
+             return "iMessage;-;user@example.com"
+ 
+-        async def fake_api_post(path, payload):
++        async def fake_api_post(path, payload, *, timeout=None):
+             sent.append(payload["message"])
+             return {"data": {"guid": f"msg-{len(sent)}"}}
+ 
+diff --git a/tests/gateway/test_send_retry.py b/tests/gateway/test_send_retry.py
+index 62945d9f4..412e7b1bc 100644
+--- a/tests/gateway/test_send_retry.py
++++ b/tests/gateway/test_send_retry.py
+@@ -271,6 +271,36 @@ class TestSendWithRetryFallback:
+         # Fallback content should be plain-text notice
+         assert "plain text" in adapter._send_calls[1][1].lower()
+ 
++    @pytest.mark.asyncio
++    async def test_non_network_failure_logs_attempted_payload_and_full_error(self, caplog):
++        adapter = _StubAdapter()
++        adapter._send_results = [
++            SendResult(
++                success=False,
++                error="Bad Request: can't parse entities at byte offset 12",
++                raw_response={"ok": False, "description": "entity parse failed"},
++            ),
++            SendResult(success=True, message_id="fallback_ok"),
++        ]
++        with patch("asyncio.sleep", new_callable=AsyncMock):
++            result = await adapter._send_with_retry(
++                "chat1",
++                "**broken markdown**",
++                reply_to="msg123",
++                metadata={"parse_mode": "MarkdownV2"},
++                max_retries=2,
++                base_delay=0,
++            )
++        assert result.success
++        log_text = caplog.text
++        assert "Attempted payload" in log_text
++        assert "chat1" in log_text
++        assert "msg123" in log_text
++        assert "MarkdownV2" in log_text
++        assert "**broken markdown**" in log_text
++        assert "can't parse entities at byte offset 12" in log_text
++        assert "entity parse failed" in log_text
++
+     @pytest.mark.asyncio
+     async def test_fallback_failure_logged_but_not_raised(self):
+         adapter = _StubAdapter()
