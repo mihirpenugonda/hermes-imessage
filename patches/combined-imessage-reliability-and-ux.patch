@@ -1,0 +1,42 @@
+diff --git a/gateway/platforms/bluebubbles.py b/gateway/platforms/bluebubbles.py
+index 12b082225..7518e009d 100644
+--- a/gateway/platforms/bluebubbles.py
++++ b/gateway/platforms/bluebubbles.py
+@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
+ DEFAULT_WEBHOOK_HOST = "127.0.0.1"
+ DEFAULT_WEBHOOK_PORT = 8645
+ DEFAULT_WEBHOOK_PATH = "/bluebubbles-webhook"
+-MAX_TEXT_LENGTH = 4000
++MAX_TEXT_LENGTH = 800
+ 
+ # Tapback reaction codes (BlueBubbles associatedMessageType values)
+ _TAPBACK_ADDED = {
+diff --git a/gateway/run.py b/gateway/run.py
+index 8c2c6478c..dabcceda9 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -11261,10 +11261,21 @@ class GatewayRunner:
+             if _env_tp and not _tool_progress_configured
+             else (_resolved_tp or _env_tp or "all")
+         )
+-        # Disable tool progress for webhooks - they don't support message editing,
+-        # so each progress line would be sent as a separate message.
++        # Disable tool progress for webhooks and platforms without message editing.
++        # Otherwise every tool-progress update becomes a separate chat bubble
++        # (especially noisy on iMessage/BlueBubbles).
+         from gateway.config import Platform
+-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
++        _progress_adapter = self.adapters.get(source.platform)
++        _progress_adapter_supports_edit = (
++            getattr(_progress_adapter, "SUPPORTS_MESSAGE_EDITING", True)
++            if _progress_adapter
++            else True
++        )
++        tool_progress_enabled = (
++            progress_mode != "off"
++            and source.platform != Platform.WEBHOOK
++            and _progress_adapter_supports_edit
++        )
+         # Natural assistant status messages are intentionally independent from
+         # tool progress and token streaming. Users can keep tool_progress quiet
+         # in chat platforms while opting into concise mid-turn updates.

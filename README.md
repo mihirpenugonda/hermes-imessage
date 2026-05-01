@@ -2,7 +2,7 @@
 
 Patches and a Hermes skill for making Hermes Agent's BlueBubbles/iMessage gateway safer and less annoying in real iMessage conversations.
 
-This repo is modeled after benjaminsehl/hermes-imessage, but focuses on the reliability fixes from Mihir's Hermes setup: no duplicate sends after BlueBubbles timeouts, better chat GUID resolution, better failure logs, and stable DM session IDs.
+This repo is modeled after benjaminsehl/hermes-imessage. It includes Benjamin's iMessage UX patches and adds the reliability fixes from Mihir's Hermes setup: no duplicate sends after BlueBubbles timeouts, better chat GUID resolution, better failure logs, and stable DM session IDs.
 
 ## What it fixes
 
@@ -44,7 +44,15 @@ From a Hermes Agent checkout:
 
 ```bash
 cd ~/.hermes/hermes-agent
+
+# Reliability fixes from this repo
 git apply /path/to/hermes-imessage/patches/bluebubbles-reliability.patch
+
+# Optional UX patches from benjaminsehl/hermes-imessage
+git apply /path/to/hermes-imessage/patches/bluebubbles-ux.patch
+git apply /path/to/hermes-imessage/patches/gateway-ack-and-progress.patch
+git apply /path/to/hermes-imessage/patches/session-platform-notes.patch
+
 hermes gateway restart
 ```
 
@@ -74,12 +82,16 @@ In live logs, normal replies to existing iMessage DMs should use `/api/v1/messag
 
 ## Files
 
-```text
-patches/bluebubbles-reliability.patch
-skill/imessage-reliability/SKILL.md
-references/bluebubbles-timeouts.md
-```
-
+What’s in it:
+- patches/bluebubbles-reliability.patch
+- patches/bluebubbles-ux.patch
+- patches/gateway-ack-and-progress.patch
+- patches/session-platform-notes.patch
+- skill/imessage-reliability/SKILL.md
+- skill/imessage-ux/SKILL.md
+- references/bluebubbles-timeouts.md
+- README with install and verification steps
+- MIT license
 ## Requirements
 
 - Hermes Agent with BlueBubbles gateway support
